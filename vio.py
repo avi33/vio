@@ -1,31 +1,5 @@
-"""
-Minimal orchestrator for a monocular VIO pipeline that uses:
-- Block/pyramidal optical flow for feature tracking
-- IMU preintegration between frames
-- MSCKF-style estimator skeleton (hooks provided)
-
-This file wires together the modules and runs a timestamp-ordered loop.
-It is designed as a clear starting point; fill in the TODOs in the estimator
-and preintegration Jacobians for a working system.
-
-Dependencies:
-  - Python 3.9+
-  - numpy, scipy, opencv-python, dataclasses
-
-Optional:
-  - tqdm for progress
-
-Dataset support:
-  - A simple EuRoC loader is included for quick testing.
-
-Author: you + ChatGPT
-License: MIT
-"""
-from __future__ import annotations
 import os
 import math
-import queue
-import threading
 import time
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Optional
@@ -56,7 +30,7 @@ class Config:
     img_size: Tuple[int, int]
 
     # Feature tracking
-    max_features: int = 1000
+    max_features: int = 500
     grid_rows: int = 20
     grid_cols: int = 30
     patch_win: int = 21
@@ -90,7 +64,7 @@ class Config:
     # Dataset
     dataset_root: str = "./EuRoC/MH_01_easy"
 
-
+    min_dist = 3
 # ==========================
 # Camera model utilities
 # ==========================
@@ -231,28 +205,58 @@ class BlockFlowTracker:
     #         dists = cv2.distanceTransform((np.ones(img.shape, np.uint8)*255), cv2.DIST_L2, 3)
     #     return pts, [None]*len(pts)
 
+    # def _spawn_new(self, img: np.ndarray, existing: np.ndarray):
+    #     need = max(0, self.cfg.max_features - (0 if existing is None else len(existing)))
+    #     if need == 0:
+    #         return np.empty((0,2), np.float32), []
+
+    #     pts = self._good_corners_grid(img, need)
+
+    #     # Remove new points that are too close to existing points
+    #     if existing is not None and len(existing) > 0 and len(pts) > 0:
+    #         mask = np.ones(img.shape, np.uint8) * 255
+    #         for e in existing.astype(int):
+    #             x, y = e
+    #             cv2.circle(mask, (x, y), 5, 0, -1)  # zero-out around existing pts
+    #         dists = cv2.distanceTransform(mask, cv2.DIST_L2, 3)
+    #         keep = []
+    #         for p in pts:
+    #             x, y = int(p[0]), int(p[1])
+    #             if dists[y, x] > 1:  # at least 1 px away
+    #                 keep.append(p)
+    #         pts = np.array(keep, np.float32)
+
+    #     return pts, [None]*len(pts)
+
     def _spawn_new(self, img: np.ndarray, existing: np.ndarray):
         need = max(0, self.cfg.max_features - (0 if existing is None else len(existing)))
         if need == 0:
-            return np.empty((0,2), np.float32), []
+            return np.empty((0, 2), np.float32), []
 
-        pts = self._good_corners_grid(img, need)
+        h, w = img.shape[:2]
+        mask = np.ones((h, w), np.uint8) * 255
 
-        # Remove new points that are too close to existing points
-        if existing is not None and len(existing) > 0 and len(pts) > 0:
-            mask = np.ones(img.shape, np.uint8) * 255
+        # Draw circles around existing points to block nearby spawning
+        if existing is not None and len(existing) > 0:
             for e in existing.astype(int):
                 x, y = e
-                cv2.circle(mask, (x, y), 5, 0, -1)  # zero-out around existing pts
-            dists = cv2.distanceTransform(mask, cv2.DIST_L2, 3)
-            keep = []
-            for p in pts:
-                x, y = int(p[0]), int(p[1])
-                if dists[y, x] > 1:  # at least 1 px away
-                    keep.append(p)
-            pts = np.array(keep, np.float32)
+                if 0 <= x < w and 0 <= y < h:
+                    cv2.circle(mask, (x, y), self.cfg.min_dist, 0, -1)
 
-        return pts, [None]*len(pts)
+        # Find good corners only in free regions
+        pts = cv2.goodFeaturesToTrack(
+            img,
+            maxCorners=need,
+            qualityLevel=0.01,
+            minDistance=self.cfg.min_dist,
+            mask=mask
+        )
+
+        if pts is None:
+            return np.empty((0, 2), np.float32), []
+
+        pts = pts.reshape(-1, 2)
+        return pts, [None] * len(pts)
 
     def track(self, frame: Frame, imu_rot_pred: Optional[np.ndarray]=None):
         img = frame.img
@@ -381,7 +385,7 @@ class EuRoC:
         self.imu_csv = os.path.join(self.imu_dir, "data.csv")
         # self.cam_list = self._read_csv(self.cam_csv)
         # self.imu_list = self._read_csv(self.imu_csv)
-        self.cam_list, self.imu_list = self._read_rosbag(root + '/MH_01_easy.bag', None)
+        self.cam_list, self.imu_list = self._read_rosbag(root + '/V2_02_medium.bag', None)
         # convert ns to seconds
         # self.cam_list = [(ts*1e-9, os.path.join(self.cam_dir, "data", fn)) for ts, fn in self.cam_list]
         # self.imu_list = [(ts*1e-9, w, a) for ts,(w,a) in self.imu_list]
@@ -455,7 +459,13 @@ class VIO:
         ds = EuRoC(dataset_root)
         imu_idx = 0
         fps_camera = (1/np.diff(([t for t, _ in ds.cam_list])).mean()).round()        
+        keyframes: List[Frame] = []
+        tracks: List[np.ndarray] = []
+        h, w = ds.cam_list[0][1].shape[:2]
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # or 'XVID', 'MJPG', etc.
+        f_out = cv2.VideoWriter('result.mp4', fourcc, fps_camera, (w, h))
         # Iterate over images; integrate all IMU samples up to each image
+        frame_id = 0        
         for t_img, img in tqdm(ds.cam_list, desc="Frames"):
             start_loop = time.time()
             # integrate imu up to this frame
@@ -487,6 +497,10 @@ class VIO:
             median_flow = 0.0 if len(p0)==0 else float(np.median(np.linalg.norm(p1 - p0, axis=1)))
             keep_ratio = 0 if self.tracker.prev_ids is None else len(ids) / max(1,len(self.tracker.prev_ids))
             make_keyframe = (median_flow > self.cfg.keyframe_flow_px) or (keep_ratio < self.cfg.min_track_keep)
+            if make_keyframe:
+                keyframes.append(frame)
+                new_pts, new_meta = self.tracker._spawn_new(img_u, p1)
+                tracks.extend(new_pts)
 
             # clone pose and update (placeholder)
             self.est.clone_pose(t_img)
@@ -498,17 +512,9 @@ class VIO:
             vis = cv2.cvtColor(img_u, cv2.COLOR_GRAY2BGR)
             for uv in p1.astype(int):
                 cv2.circle(vis, tuple(uv), 2, (0,255,0), -1)
-            # cv2.putText(vis, 
-            #             f"t={t_img:.3f}s flow={median_flow:.1f}px tracks={len(ids)}", 
-            #             (10,20),
-            #             cv2.FONT_HERSHEY_SIMPLEX, 
-            #             0.5, 
-            #             (0,255,0), 
-            #             1, 
-            #             cv2.LINE_AA)
-                        
+
             cv2.putText(vis,
-                            f"t={t_img:.3f}s flow={median_flow:.1f}px tracks={len(ids)} FPS={proc_fps:.1f}",
+                            f"t={t_img-ds.cam_list[0][0]:.1f}s flow={median_flow:.1f}px tracks={len(ids)} FPS={proc_fps:.1f}",
                             (10, 20),
                             cv2.FONT_HERSHEY_SIMPLEX,
                             0.5,
@@ -518,17 +524,20 @@ class VIO:
 
             
             
-            cv2.imshow('tracks', vis)            
+            cv2.imshow('tracks', vis)
+            f_out.write(vis)            
             key = cv2.waitKey(1)
             if key == 27:
                 break
             elapsed = time.time() - start_loop
             sleep_time = max(0, 1/fps_camera - elapsed)
             time.sleep(sleep_time)
-
+            frame_id += 1
+            if frame_id > 500:
+                break
 
         cv2.destroyAllWindows()
-
+        f_out.release()
 
 # ==========================
 # Main
