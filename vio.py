@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Minimal orchestrator for a monocular VIO pipeline that uses:
 - Block/pyramidal optical flow for feature tracking
@@ -30,9 +29,12 @@ import threading
 import time
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Optional
-
+import time
 import numpy as np
 import cv2
+
+import rosbag
+from cv_bridge import CvBridge
 
 try:
     from tqdm import tqdm
@@ -219,14 +221,37 @@ class BlockFlowTracker:
         pts = np.vstack(pts_all).astype(np.float32)
         return pts
 
+    # def _spawn_new(self, img: np.ndarray, existing: np.ndarray):
+    #     need = max(0, self.cfg.max_features - (0 if existing is None else len(existing)))
+    #     if need == 0:
+    #         return np.empty((0,2), np.float32), []
+    #     pts = self._good_corners_grid(img, need)
+    #     # Remove near existing
+    #     if existing is not None and len(existing)>0 and len(pts)>0:
+    #         dists = cv2.distanceTransform((np.ones(img.shape, np.uint8)*255), cv2.DIST_L2, 3)
+    #     return pts, [None]*len(pts)
+
     def _spawn_new(self, img: np.ndarray, existing: np.ndarray):
         need = max(0, self.cfg.max_features - (0 if existing is None else len(existing)))
         if need == 0:
             return np.empty((0,2), np.float32), []
+
         pts = self._good_corners_grid(img, need)
-        # Remove near existing
-        if existing is not None and len(existing)>0 and len(pts)>0:
-            dists = cv2.distanceTransform((np.ones(img.shape, np.uint8)*255), cv2.DIST_L2, 3)
+
+        # Remove new points that are too close to existing points
+        if existing is not None and len(existing) > 0 and len(pts) > 0:
+            mask = np.ones(img.shape, np.uint8) * 255
+            for e in existing.astype(int):
+                x, y = e
+                cv2.circle(mask, (x, y), 5, 0, -1)  # zero-out around existing pts
+            dists = cv2.distanceTransform(mask, cv2.DIST_L2, 3)
+            keep = []
+            for p in pts:
+                x, y = int(p[0]), int(p[1])
+                if dists[y, x] > 1:  # at least 1 px away
+                    keep.append(p)
+            pts = np.array(keep, np.float32)
+
         return pts, [None]*len(pts)
 
     def track(self, frame: Frame, imu_rot_pred: Optional[np.ndarray]=None):
@@ -354,11 +379,12 @@ class EuRoC:
         self.imu_dir = os.path.join(root, "mav0", "imu0")
         self.cam_csv = os.path.join(self.cam_dir, "data.csv")
         self.imu_csv = os.path.join(self.imu_dir, "data.csv")
-        self.cam_list = self._read_csv(self.cam_csv)
-        self.imu_list = self._read_csv(self.imu_csv)
+        # self.cam_list = self._read_csv(self.cam_csv)
+        # self.imu_list = self._read_csv(self.imu_csv)
+        self.cam_list, self.imu_list = self._read_rosbag(root + '/MH_01_easy.bag', None)
         # convert ns to seconds
-        self.cam_list = [(ts*1e-9, os.path.join(self.cam_dir, "data", fn)) for ts, fn in self.cam_list]
-        self.imu_list = [(ts*1e-9, w, a) for ts,(w,a) in self.imu_list]
+        # self.cam_list = [(ts*1e-9, os.path.join(self.cam_dir, "data", fn)) for ts, fn in self.cam_list]
+        # self.imu_list = [(ts*1e-9, w, a) for ts,(w,a) in self.imu_list]
 
     @staticmethod
     def _read_csv(path):
@@ -378,6 +404,39 @@ class EuRoC:
                     a = np.array(list(map(float, parts[4:7])), dtype=np.float64)
                     out.append((ts, (w,a)))
         return out
+    
+    @staticmethod
+    def _read_rosbag(bag_path: str, export_dir: str):
+        """Read ROS bag and store images as PNG to match CSV interface."""
+        IMAGE_TOPIC = "/cam0/image_raw"
+        IMU_TOPIC   = "/imu0"        
+
+        bag = rosbag.Bag(bag_path)
+        bridge = CvBridge()
+        cam_list = []
+        imu_list = []        
+        for topic, msg, _ in bag.read_messages(topics=[IMAGE_TOPIC, IMU_TOPIC]):
+            if topic == IMAGE_TOPIC:
+                ts = msg.header.stamp.to_sec()
+                img = bridge.imgmsg_to_cv2(msg, desired_encoding="mono8")
+                # fname = f"{int(ts*1e9)}.png"
+                # fpath = os.path.join(export_dir, fname)
+                # cv2.imwrite(fpath, img)
+                cam_list.append((ts, img))
+                # data_list.append((ts, img))
+            elif topic == IMU_TOPIC:
+                ts = msg.header.stamp.to_sec()
+                w = np.array([msg.angular_velocity.x,
+                              msg.angular_velocity.y,
+                              msg.angular_velocity.z], dtype=np.float64)
+                a = np.array([msg.linear_acceleration.x,
+                              msg.linear_acceleration.y,
+                              msg.linear_acceleration.z], dtype=np.float64)
+                imu_list.append((ts, w, a))
+                # data_list.append((ts, img))
+
+        bag.close()
+        return cam_list, imu_list
 
 
 # ==========================
@@ -395,8 +454,10 @@ class VIO:
     def run_euroc(self, dataset_root: str):
         ds = EuRoC(dataset_root)
         imu_idx = 0
+        fps_camera = (1/np.diff(([t for t, _ in ds.cam_list])).mean()).round()        
         # Iterate over images; integrate all IMU samples up to each image
-        for t_img, img_path in tqdm(ds.cam_list, desc="Frames"):
+        for t_img, img in tqdm(ds.cam_list, desc="Frames"):
+            start_loop = time.time()
             # integrate imu up to this frame
             imu_between: List[ImuSample] = []
             while imu_idx < len(ds.imu_list) and ds.imu_list[imu_idx][0] <= t_img:
@@ -413,7 +474,7 @@ class VIO:
             self.preint.integrate(imu_between, self.est.state.bg, self.est.state.ba)
 
             # read + undistort image
-            img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+            # img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
             if img is None:
                 continue
             img_u = self.cam.undistort(img)
@@ -431,17 +492,41 @@ class VIO:
             self.est.clone_pose(t_img)
             active_tracks = self.tracker.get_active_tracks(min_obs=3)
             self.est.update_msckf(active_tracks)
-
+            proc_time = time.time() - start_loop
+            proc_fps = 1.0 / proc_time if proc_time > 0 else 0.0            
             # (Optional) visualize
             vis = cv2.cvtColor(img_u, cv2.COLOR_GRAY2BGR)
             for uv in p1.astype(int):
                 cv2.circle(vis, tuple(uv), 2, (0,255,0), -1)
-            cv2.putText(vis, f"t={t_img:.3f}s flow={median_flow:.1f}px tracks={len(ids)}", (10,20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1, cv2.LINE_AA)
-            cv2.imshow('tracks', vis)
+            # cv2.putText(vis, 
+            #             f"t={t_img:.3f}s flow={median_flow:.1f}px tracks={len(ids)}", 
+            #             (10,20),
+            #             cv2.FONT_HERSHEY_SIMPLEX, 
+            #             0.5, 
+            #             (0,255,0), 
+            #             1, 
+            #             cv2.LINE_AA)
+                        
+            cv2.putText(vis,
+                            f"t={t_img:.3f}s flow={median_flow:.1f}px tracks={len(ids)} FPS={proc_fps:.1f}",
+                            (10, 20),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5,
+                            (0, 255, 0),
+                            1,
+                            cv2.LINE_AA)
+
+            
+            
+            cv2.imshow('tracks', vis)            
             key = cv2.waitKey(1)
             if key == 27:
                 break
+            elapsed = time.time() - start_loop
+            sleep_time = max(0, 1/fps_camera - elapsed)
+            time.sleep(sleep_time)
+
+
         cv2.destroyAllWindows()
 
 
@@ -454,7 +539,7 @@ if __name__ == "__main__":
         fx=458.654, fy=457.296, cx=367.215, cy=248.375,
         dist=np.array([-0.28340811, 0.07395907, 0.00019359, 1.76187114e-05, 0.0], dtype=np.float64),
         img_size=(752, 480),
-        dataset_root=os.environ.get('EUROC_ROOT', './EuRoC/MH_01_easy')
+        dataset_root=os.environ.get('EUROC_ROOT', '../../datasets/vio/')
     )
 
     vio = VIO(cfg)
