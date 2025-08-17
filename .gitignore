@@ -5,3 +5,5 @@ ipynb_checkpoints
 *.pyo
 *.pyd
 *.pkl
+*.mp4
+*.avi
