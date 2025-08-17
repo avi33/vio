@@ -455,28 +455,123 @@ class VIO:
         self.est = MSCKF(cfg, self.cam)
         self.preint = Preintegrator(cfg)
 
+    def initialize_from_imu(self, imu_samples: List[ImuSample], warmup_s: float = 2.0):
+        """
+        Estimate IMU biases & initial orientation from warmup IMU samples.
+
+        After this call:
+        - self.est.state.bg  <- estimated gyro bias (rad/s)
+        - self.est.state.ba  <- estimated accel bias (m/s^2)
+        - self.est.state.R   <- initial orientation (3x3)
+        - self.est.state.v   <- zeros
+        """
+        if len(imu_samples) == 0:
+            print("[VIO init] no imu samples")
+            return
+
+        # Stack arrays
+        w_all = np.stack([m.w for m in imu_samples], axis=0)   # (N,3)
+        a_all = np.stack([m.a for m in imu_samples], axis=0)   # (N,3)
+
+        # 1) gyro bias = mean(angular velocity)
+        bg_est = w_all.mean(axis=0)
+
+        # 2) mean accel measurement
+        a_mean = a_all.mean(axis=0)
+
+        # World gravity vector (matching your propagate sign convention)
+        g_world = np.array([0.0, 0.0, -self.cfg.g_mag], dtype=np.float64)
+
+        # 3) solve for rotation R0 that maps a_mean (body) to -g_world (world)
+        #    we want R0 @ a_mean ≈ -g_world  => R0 maps measured accel to gravity direction.
+        a_b = a_mean / (np.linalg.norm(a_mean) + 1e-12)
+        g_w = (-g_world) / (np.linalg.norm(g_world) + 1e-12)  # note we map to -g_world direction
+
+        v = np.cross(a_b, g_w)
+        s = np.linalg.norm(v)
+        c = float(np.dot(a_b, g_w))
+        if s < 1e-12:
+            # nearly collinear: either already aligned or 180 deg flip
+            if c > 0:
+                R0 = np.eye(3)
+            else:
+                R0 = -np.eye(3)
+        else:
+            vx = np.array([[0, -v[2], v[1]],
+                        [v[2], 0, -v[0]],
+                        [-v[1], v[0], 0]], dtype=np.float64)
+            R0 = np.eye(3) + vx + vx @ vx * ((1 - c) / (s * s))
+
+        # 4) accel bias from stationary condition:
+        #    R0 @ (a_mean - ba) + g_world = 0  =>  ba = a_mean + R0.T @ g_world
+        ba_est = a_mean + R0.T @ g_world
+
+        # Apply to estimator state
+        self.est.state.bg = bg_est.copy()
+        self.est.state.ba = ba_est.copy()
+        self.est.state.R  = R0.copy()
+        self.est.state.v  = np.zeros(3)
+
+        # Sanity check: residual world accel (should be near zero)
+        residual = R0 @ (a_mean - ba_est) + g_world
+        print("[VIO init] bg_est:", bg_est)
+        print("[VIO init] a_mean:", a_mean)
+        print("[VIO init] ba_est:", ba_est)
+        print("[VIO init] residual world accel (should be ~0):", residual)
+
     def run_euroc(self, dataset_root: str):
         ds = EuRoC(dataset_root)
         imu_idx = 0
-        fps_camera = (1/np.diff(([t for t, _ in ds.cam_list])).mean()).round()        
+
+        # warm-up IMU (collect first warmup_s seconds)
+        warmup_s = 2.0
+        warm_imu: List[ImuSample] = []
+        t0_imu = ds.imu_list[0][0] if len(ds.imu_list) > 0 else 0.0
+        # collect warm-up and count how many samples consumed
+        warm_count = 0
+        for i, (t, w, a) in enumerate(ds.imu_list):
+            if t - t0_imu <= warmup_s:
+                warm_imu.append(ImuSample(t=t, w=w, a=a))
+                warm_count += 1
+            else:
+                break
+
+        if len(warm_imu) > 0:
+            self.initialize_from_imu(warm_imu, warmup_s=warmup_s)
+            imu_idx = warm_count  # skip these samples in main loop
+            print(f"[VIO] used {len(warm_imu)} IMU samples to initialize, imu_idx set to {imu_idx}")
+        else:
+            print("[VIO] No warmup IMU samples found; running with default initial state.")
+
+        # compute camera fps from timestamps
+        if len(ds.cam_list) >= 2:
+            fps_camera = float((1.0 / np.diff([t for t, _ in ds.cam_list]).mean()))
+            # limit to a reasonable integer for VideoWriter fps parameter later
+            fps_camera_round = int(round(fps_camera))
+        else:
+            fps_camera = 30.0
+            fps_camera_round = 30
+
         keyframes: List[Frame] = []
         tracks: List[np.ndarray] = []
         h, w = ds.cam_list[0][1].shape[:2]
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # or 'XVID', 'MJPG', etc.
-        f_out = cv2.VideoWriter('result.mp4', fourcc, fps_camera, (w, h))
+        f_out = cv2.VideoWriter('result.mp4', fourcc, fps_camera_round, (w, h))
+
+        frame_id = 0
         # Iterate over images; integrate all IMU samples up to each image
-        frame_id = 0        
         for t_img, img in tqdm(ds.cam_list, desc="Frames"):
             start_loop = time.time()
             # integrate imu up to this frame
             imu_between: List[ImuSample] = []
             while imu_idx < len(ds.imu_list) and ds.imu_list[imu_idx][0] <= t_img:
-                t, w, a = ds.imu_list[imu_idx]
-                imu_between.append(ImuSample(t=t, w=w, a=a))
+                t, w_m, a_m = ds.imu_list[imu_idx]
+                imu_between.append(ImuSample(t=t, w=w_m, a=a_m))
                 # propagate estimator nominal at high-rate too (optional)
-                if imu_idx>0:
+                if imu_idx > 0:
                     dt = ds.imu_list[imu_idx][0] - ds.imu_list[imu_idx-1][0]
-                    self.est.propagate_imu(ImuSample(t, w, a), dt)
+                    # propagate using current biases and orientation
+                    self.est.propagate_imu(ImuSample(t, w_m, a_m), dt)
                 imu_idx += 1
 
             # preintegrate between last frame and this frame (for later use)
@@ -484,7 +579,6 @@ class VIO:
             self.preint.integrate(imu_between, self.est.state.bg, self.est.state.ba)
 
             # read + undistort image
-            # img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
             if img is None:
                 continue
             img_u = self.cam.undistort(img)
@@ -494,8 +588,8 @@ class VIO:
             ids, p0, p1, mask = self.tracker.track(frame)
 
             # keyframe policy (simple)
-            median_flow = 0.0 if len(p0)==0 else float(np.median(np.linalg.norm(p1 - p0, axis=1)))
-            keep_ratio = 0 if self.tracker.prev_ids is None else len(ids) / max(1,len(self.tracker.prev_ids))
+            median_flow = 0.0 if len(p0) == 0 else float(np.median(np.linalg.norm(p1 - p0, axis=1)))
+            keep_ratio = 0 if self.tracker.prev_ids is None else len(ids) / max(1, len(self.tracker.prev_ids))
             make_keyframe = (median_flow > self.cfg.keyframe_flow_px) or (keep_ratio < self.cfg.min_track_keep)
             if make_keyframe:
                 keyframes.append(frame)
@@ -506,39 +600,42 @@ class VIO:
             self.est.clone_pose(t_img)
             active_tracks = self.tracker.get_active_tracks(min_obs=3)
             self.est.update_msckf(active_tracks)
+            print(self.est.state.v)
+            # get pose / velocity for logging or plotting
+            pos = self.est.state.p.copy()
+            vel = self.est.state.v.copy()
+
             proc_time = time.time() - start_loop
-            proc_fps = 1.0 / proc_time if proc_time > 0 else 0.0            
+            proc_fps = 1.0 / proc_time if proc_time > 0 else 0.0
+
             # (Optional) visualize
             vis = cv2.cvtColor(img_u, cv2.COLOR_GRAY2BGR)
             for uv in p1.astype(int):
-                cv2.circle(vis, tuple(uv), 2, (0,255,0), -1)
+                cv2.circle(vis, tuple(uv), 2, (0, 255, 0), -1)
 
             cv2.putText(vis,
-                            f"t={t_img-ds.cam_list[0][0]:.1f}s flow={median_flow:.1f}px tracks={len(ids)} FPS={proc_fps:.1f}",
-                            (10, 20),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.5,
-                            (0, 255, 0),
-                            1,
-                            cv2.LINE_AA)
+                        f"t={t_img-ds.cam_list[0][0]:.1f}s flow={median_flow:.1f}px tracks={len(ids)} FPS={proc_fps:.1f}",
+                        (10, 20),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (0, 255, 0),
+                        1,
+                        cv2.LINE_AA)
 
-            
-            
             cv2.imshow('tracks', vis)
-            f_out.write(vis)            
+            # f_out.write(vis)
             key = cv2.waitKey(1)
             if key == 27:
                 break
             elapsed = time.time() - start_loop
-            sleep_time = max(0, 1/fps_camera - elapsed)
+            sleep_time = max(0, 1.0 / fps_camera - elapsed)
             time.sleep(sleep_time)
             frame_id += 1
             if frame_id > 500:
                 break
 
         cv2.destroyAllWindows()
-        f_out.release()
-
+        # f_out.release()
 # ==========================
 # Main
 # ==========================
